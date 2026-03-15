@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 360-Degree Performance Review & OKR Tracking System
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        CYCLES_TABLE: !Ref ReviewCyclesTable
+        EMPLOYEES_TABLE: !Ref EmployeesTable
+        FORM_CONFIG_TABLE: !Ref FormConfigTable
+        SUBMISSIONS_TABLE: !Ref SubmissionsTable
+        OKR_TABLE: !Ref OKRTable
+        REPORTS_BUCKET: !Ref ReportsBucket
+        # NOTE: STATE_MACHINE_ARN intentionally NOT here — would create circular dependency.
+        # Only CycleEngineFunction needs it; it is set directly on that function below.
+        SES_SENDER_EMAIL: !Ref SESSourceEmail
+        COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+        PEER_HASH_SALT: !Ref PeerHashSalt
+
+Parameters:
+  SESSourceEmail:
+    Type: String
+    Description: Verified SES sender email address
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  PeerHashSalt:
+    Type: String
+    NoEcho: true
+    Description: Secret salt for peer reviewer SHA-256 hashing (keep this secret)
+
+# ─── DynamoDB Tables ─────────────────────────────────────────────────────────
+
+Resources:
+
+  ReviewCyclesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "review_cycles_${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cycle_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: start_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cycle_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-start_date-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: start_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  EmployeesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "employees_${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: employee_id
+          AttributeType: S
+        - AttributeName: department
+          AttributeType: S
+      KeySchema:
+        - AttributeName: employee_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: department-index
+          KeySchema:
+            - AttributeName: department
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  FormConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "form_config_${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: form_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: form_type
+          KeyType: HASH
+
+  SubmissionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "review_submissions_${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: submission_id
+          AttributeType: S
+        - AttributeName: cycle_id
+          AttributeType: S
+        - AttributeName: reviewee_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: submission_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: cycle-reviewee-index
+          KeySchema:
+            - AttributeName: cycle_id
+              KeyType: HASH
+            - AttributeName: reviewee_id
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  OKRTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "okr_tracker_${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: okr_id
+          AttributeType: S
+        - AttributeName: employee_id
+          AttributeType: S
+        - AttributeName: quarter
+          AttributeType: S
+      KeySchema:
+        - AttributeName: okr_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: employee-quarter-index
+          KeySchema:
+            - AttributeName: employee_id
+              KeyType: HASH
+            - AttributeName: quarter
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+# ─── S3 Bucket for Reports ───────────────────────────────────────────────────
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "performance-reports-${Environment}-${AWS::AccountId}"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+# ─── Cognito ─────────────────────────────────────────────────────────────────
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "performance-review-pool-${Environment}"
+      AutoVerifiedAttributes: [email]
+      Schema:
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+        - Name: employee_id
+          AttributeDataType: String
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "performance-review-client-${Environment}"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      TokenValidityUnits:
+        AccessToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 8
+      RefreshTokenValidity: 30
+
+# ─── API Gateway ─────────────────────────────────────────────────────────────
+
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "performance-review-api-${Environment}"
+      StageName: !Ref Environment
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+# ─── Lambda Functions ─────────────────────────────────────────────────────────
+
+  # Review Cycle CRUD
+  CycleEngineFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ReviewCycleStateMachine
+    Properties:
+      FunctionName: !Sub "cycle-engine-${Environment}"
+      CodeUri: ../backend/functions/cycle_engine/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ReviewCycleStateMachine
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReviewCyclesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EmployeesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubmissionsTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt ReviewCycleStateMachine.Name
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+      Events:
+        CreateCycle:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /cycles
+            Method: POST
+        ListCycles:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /cycles
+            Method: GET
+        GetCycle:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /cycles/{cycle_id}
+            Method: GET
+        DeleteCycle:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /cycles/{cycle_id}
+            Method: DELETE
+        ListEmployees:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /employees
+            Method: GET
+
+  # Feedback submission & status
+  FeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "feedback-${Environment}"
+      CodeUri: ../backend/functions/feedback/
+      Handler: handler.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubmissionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FormConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReviewCyclesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EmployeesTable
+      Events:
+        SubmitReview:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /review/submit
+            Method: POST
+        GetStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /review/status/{employee_id}
+            Method: GET
+        GetFormConfig:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /forms/{form_type}
+            Method: GET
+
+  # OKR management
+  OKRFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "okr-${Environment}"
+      CodeUri: ../backend/functions/okr/
+      Handler: handler.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OKRTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EmployeesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+      Events:
+        CreateOKR:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /okr
+            Method: POST
+        UpdateOKR:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /okr/{okr_id}
+            Method: PUT
+        GetOKRs:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /okr/employee/{employee_id}
+            Method: GET
+        WeeklyOKRReminder:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 9 ? * MON *)
+            Description: Weekly OKR progress update prompt
+
+  # Report generation
+  ReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "report-generator-${Environment}"
+      CodeUri: ../backend/functions/reports/
+      Handler: handler.lambda_handler
+      Timeout: 120
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubmissionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReviewCyclesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EmployeesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OKRTable
+        - S3CrudPolicy:
+            BucketName: !Ref ReportsBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+      Events:
+        GenerateReport:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /report/{cycle_id}/{employee_id}
+            Method: POST
+        GetReport:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /report/{cycle_id}/{employee_id}
+            Method: GET
+        HRDashboard:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /dashboard/{cycle_id}
+            Method: GET
+        DeleteCycleReports:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /report/{cycle_id}
+            Method: DELETE
+
+  # Reminder Lambda (triggered by Step Functions and EventBridge)
+  ReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "reminder-${Environment}"
+      CodeUri: ../backend/functions/cycle_engine/
+      Handler: reminder.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReviewCyclesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SubmissionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EmployeesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+
+# ─── Step Functions ───────────────────────────────────────────────────────────
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ReminderFunction.Arn
+                  - !GetAtt ReportFunction.Arn
+
+  ReviewCycleStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "ReviewCycleWorkflow-${Environment}"
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Manages a review cycle from creation to report generation",
+          "StartAt": "NotifyParticipants",
+          "States": {
+            "NotifyParticipants": {
+              "Type": "Task",
+              "Resource": "${ReminderFunction.Arn}",
+              "Parameters": {
+                "action": "notify_start",
+                "cycle_id.$": "$$.Execution.Input.cycle_id"
+              },
+              "Next": "WaitFor3DayReminder",
+              "ResultPath": "$.notify_result"
+            },
+            "WaitFor3DayReminder": {
+              "Type": "Wait",
+              "TimestampPath": "$.reminder_3day_at",
+              "InputPath": "$$.Execution.Input",
+              "Next": "Send3DayReminder"
+            },
+            "Send3DayReminder": {
+              "Type": "Task",
+              "Resource": "${ReminderFunction.Arn}",
+              "Parameters": {
+                "action": "remind_3day",
+                "cycle_id.$": "$$.Execution.Input.cycle_id"
+              },
+              "Next": "WaitFor1DayReminder",
+              "ResultPath": "$.remind_3day_result"
+            },
+            "WaitFor1DayReminder": {
+              "Type": "Wait",
+              "TimestampPath": "$.reminder_1day_at",
+              "InputPath": "$$.Execution.Input",
+              "Next": "Send1DayReminder"
+            },
+            "Send1DayReminder": {
+              "Type": "Task",
+              "Resource": "${ReminderFunction.Arn}",
+              "Parameters": {
+                "action": "remind_1day",
+                "cycle_id.$": "$$.Execution.Input.cycle_id"
+              },
+              "Next": "WaitForDeadline",
+              "ResultPath": "$.remind_1day_result"
+            },
+            "WaitForDeadline": {
+              "Type": "Wait",
+              "TimestampPath": "$.deadline_at",
+              "InputPath": "$$.Execution.Input",
+              "Next": "CheckCompletion"
+            },
+            "CheckCompletion": {
+              "Type": "Task",
+              "Resource": "${ReminderFunction.Arn}",
+              "Parameters": {
+                "action": "check_completion",
+                "cycle_id.$": "$$.Execution.Input.cycle_id"
+              },
+              "Next": "AllReviewsComplete?",
+              "ResultPath": "$.completion"
+            },
+            "AllReviewsComplete?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.completion.all_complete",
+                  "BooleanEquals": true,
+                  "Next": "GenerateReports"
+                }
+              ],
+              "Default": "MarkCycleClosed"
+            },
+            "GenerateReports": {
+              "Type": "Task",
+              "Resource": "${ReportFunction.Arn}",
+              "Parameters": {
+                "action": "generate_all",
+                "cycle_id.$": "$$.Execution.Input.cycle_id"
+              },
+              "Next": "MarkCycleClosed",
+              "ResultPath": "$.reports"
+            },
+            "MarkCycleClosed": {
+              "Type": "Task",
+              "Resource": "${ReminderFunction.Arn}",
+              "Parameters": {
+                "action": "close_cycle",
+                "cycle_id.$": "$$.Execution.Input.cycle_id"
+              },
+              "End": true
+            }
+          }
+        }
+
+# ─── Outputs ─────────────────────────────────────────────────────────────────
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+  ReportsBucketName:
+    Description: S3 bucket for HTML reports
+    Value: !Ref ReportsBucket
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref ReviewCycleStateMachine
